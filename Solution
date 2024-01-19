@@ -178,7 +178,7 @@ def generate_image(dot_file_path, image_file_path, image_format="png"):
     print(f"Image generated successfully: {image_file_path}")
 
 def main():
-    access_token = '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'
+    access_token = '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'
     repo_owner = "graphql-python"
     repo_name = "graphene"
 
