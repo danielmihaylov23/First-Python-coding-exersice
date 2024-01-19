@@ -1,0 +1,223 @@
+import os
+import subprocess
+from gql import gql, Client
+from gql.transport.requests import RequestsHTTPTransport
+
+test_repo = "graphql-python/graphene"
+
+def fetch_default_branch(repo_owner, repo_name, access_token):
+    graphql_endpoint = "https://api.github.com/graphql"
+
+    # GraphQL query using the gql library to get the name of the default branch
+    query_string = """
+    query GetRepository($owner: String!, $name: String!) {
+        repository(owner: $owner, name: $name) {
+            defaultBranchRef {
+                name
+            }
+        }
+    }
+    """
+    # The needed variables for the query
+    variables = {"owner": repo_owner, "name": repo_name}
+
+    # Create a GraphQL client using the qgl library
+    transport = RequestsHTTPTransport(url=graphql_endpoint, headers={"Authorization": f"Bearer {access_token}"})
+    client = Client(transport=transport, fetch_schema_from_transport=True)
+    
+    # Execute the GraphQL query
+    query = gql(query_string)
+    result = client.execute(query, variable_values=variables)
+
+    # Extracts data from the result and returns the name of the default branch.
+    default_branch = result.get("repository", {}).get("defaultBranchRef", {}).get("name")
+    return {default_branch}
+
+def fetch_commit_history(repo_owner, repo_name, default_branch, access_token):
+    graphql_endpoint = "https://api.github.com/graphql"
+
+    # GraphQL query using gql library to fetch limited commit history and get the OID, message and commit date
+    query_string = """
+    query GetCommitHistory($owner: String!, $name: String!, $defaultBranch: String!) {
+        repository(owner: $owner, name: $name) {
+            ref(qualifiedName: $defaultBranch) {
+                target {
+                    ... on Commit {
+                        history(first: 100) {
+                            edges {
+                                node {
+                                    oid
+                                    message
+                                    committedDate
+                                    parents(first: 10) {
+                                        nodes {
+                                            oid
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    """
+
+    # Variables for the GraphQL query which uses the default branch
+    variables = {"owner": repo_owner, "name": repo_name, "defaultBranch": default_branch}
+
+    # Create a GraphQL client using the gql library
+    transport = RequestsHTTPTransport(url=graphql_endpoint, headers={"Authorization": f"Bearer {access_token}"})
+    client = Client(transport=transport, fetch_schema_from_transport=True)
+
+    # Execute the GraphQL query
+    query = gql(query_string)
+    result = client.execute(query, variable_values=variables)
+
+    # Extract commit history(edges) from the result and commit graph
+    history_edges = result.get("repository", {}).get("ref", {}).get("target", {}).get("history", {}).get("edges", [])
+
+    commit_history = []
+    # For each commit save the information in the commit history variable
+    for edge in history_edges:
+        commit_node = edge.get("node", {})
+        parents_nodes = commit_node.get("parents", {}).get("nodes", [])
+        parent_oids = [parent_node.get("oid") for parent_node in parents_nodes]
+
+        commit_info = {
+            "oid": commit_node.get("oid"),
+            "message": commit_node.get("message"),
+            "committedDate": commit_node.get("committedDate"),
+            "parents": parent_oids
+        }
+        commit_history.append(commit_info)
+
+    return commit_history
+
+def build_commit_graph(commit_history):
+    # This dictionary will represent the commit graph
+    commit_graph = {}
+
+    # Go through each commit in commit_history and retrieve the commit OID and parents list OIDs
+    for commit_info in commit_history:
+        commit_oid = commit_info["oid"]
+        parent_oids = commit_info.get("parents", [])  # Retrieve the list of parent commit OIDs
+
+        # Create or update the commit graph entry
+        commit_graph[commit_oid] = {
+            "info": commit_info,
+            "parents": parent_oids
+        }
+
+    return commit_graph
+
+def is_acyclic(graph):
+    # To check if the graph is acyclic I use DFS to check if there is any back edge, and if there is that indicates a cycle
+
+    # Store the visited nodes
+    visited = set()
+    # Store nodes currently in recursion stack
+    stack = set()
+
+    # Recursive function to perform the DFS
+    def dfs(node):
+        if node in stack:
+            # Back edge found - there is a cycle
+            return False
+        if node not in visited:
+            # Mark the node as visited and recursively visit the neighbors then remove the node from the stack
+            visited.add(node)
+            stack.add(node)
+
+            for neighbor in graph.get(node, {}).get("parents", []):
+                if not dfs(neighbor):
+                    return False
+
+            stack.remove(node)
+
+        return True
+
+    # Check acyclicity for each node in the graph
+    for node in graph:
+        if node not in visited:
+            if not dfs(node):
+                return False
+
+    return True
+
+def commit_graph_dot_language(commit_graph):
+    # Store the lines of the representation
+    dot_lines = ["digraph CommitGraph {"]
+    
+    # For each commit retrieve the OID and the information about the commit
+    for commit_oid, commit_data in commit_graph.items():
+        commit_info = commit_data.get("info", {})
+        message = commit_info.get("message", "No message")
+        # Adds a line with the Dot language representation using the OID as a identifier
+        dot_lines.append(f'  "{commit_oid}" [label="{message}"]')
+        
+        # Retrieves parent OIDs and information
+        for parent_oid in commit_data.get("parents", []):
+            # Adds arrows to represent parent and child commits
+            dot_lines.append(f'  "{parent_oid}" -> "{commit_oid}"')
+
+    # Adds the closing brace to complete the representation
+    dot_lines.append("}")
+    # Joins the lines by a newline
+    return "\n".join(dot_lines)
+
+def save_dot_file(dot_representation, file_path):
+    # Adding utf-8 encoding to support Unicode characters
+    with open(file_path, "w", encoding="utf-8") as dot_file:
+        dot_file.write(dot_representation)
+
+def generate_image(dot_file_path, image_file_path, image_format="png"):
+    # Use the dot command(dot -Tpng input.dot -o output.png) to generate an image from the Dot file
+    subprocess.run(["dot", "-T", image_format, "-o", image_file_path, dot_file_path], check=True)
+    print(f"Image generated successfully: {image_file_path}")
+
+def main():
+    access_token = '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'
+    repo_owner = "graphql-python"
+    repo_name = "graphene"
+
+    # Function to access the default branch and get it's name
+    default_branch_set = fetch_default_branch(repo_owner, repo_name, access_token)
+
+    if default_branch_set:
+        # The join function extracts the information from the set object
+        default_branch = ''.join(list(default_branch_set))
+        print(f"The default branch of {repo_owner}/{repo_name} is: {default_branch}")
+        # Executes the commit_history function which gets the variable needed for the commit graph
+        commit_history = fetch_commit_history(repo_owner, repo_name, default_branch, access_token)
+
+    # Build commit graph with the commmit history variable
+    commit_graph = build_commit_graph(commit_history)
+    # Print the commit graph
+    for commit_oid, commit_info in commit_graph.items():
+        print(f"Commit ID: {commit_oid}")
+        print(f"Message: {commit_info['info']['message']}")
+        print(f"Committed Date: {commit_info['info']['committedDate']}")
+        print(f"Parents: {commit_info['parents']}\n")
+
+    # Verify acyclic
+    if is_acyclic(commit_graph):
+        print("The commit graph is acyclic.")
+    else:
+        print("The commit graph is not acyclic.")
+
+    # Print commit graph to .dot file
+    dot_representation = commit_graph_dot_language(commit_graph)
+    # Save the file on the desktop
+    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+    dot_file_path = os.path.join(desktop_path, "commit_graph.dot")
+    save_dot_file(dot_representation, dot_file_path)
+
+    # Specify the image file path and format
+    image_file_path = os.path.join(desktop_path, "commit_graph.png")
+    # Generate image for the .dot file
+    generate_image(dot_file_path, image_file_path)
+
+if __name__ == "__main__":
+    main()
